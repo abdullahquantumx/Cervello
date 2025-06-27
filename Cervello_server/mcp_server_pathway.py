@@ -73,74 +73,77 @@ openai_client = OpenAI(api_key=openai_api_key)
 # FastAPI app
 app = FastAPI()
 
+
+from pathway.xpacks.llm.document_store import DocumentStore
+from pathway.xpacks.llm import embedders, splitters, parsers
+from pathway.stdlib.indexing import HybridIndexFactory, BruteForceKnnFactory
+from pathway.stdlib.indexing.bm25 import TantivyBM25Factory
+from pathway.xpacks.llm.question_answering import RAGClient
+from pathway.udfs import DiskCache
+import pathway as pw
+
+# Shared components
+parser = parsers.UnstructuredParser()
+splitter = splitters.TokenCountSplitter(min_tokens=100, max_tokens=400)
+embedder = embedders.OpenAIEmbedder(cache_strategy=DiskCache())
+
+# Index factory: BM25 + Vector
+index_factory = HybridIndexFactory([
+    TantivyBM25Factory(),
+    BruteForceKnnFactory(embedder=embedder)
+])
+
+# Global document store and RAG client
+doc_store = DocumentStore(parser=parser, splitter=splitter, index_factory=index_factory)
+rag_client = RAGClient(document_store=doc_store, llm=embedder.llm, max_chunks=3)
+
+
 # Tool functions
-def search_similar_embeddings(query_text: str, limit: int = 10):
-    """Search for similar embeddings in the vector database."""
-    query_vector = embedding_model.encode(query_text).tolist()
-    search_result = qdrant_client.search(
-        collection_name=qdrant_collection,
-        query_vector=query_vector,
-        limit=limit
-    )
-    return search_result
+def search_similar_embeddings(query_text: str, limit: int = 5):
+    """Use RAG pipeline to fetch similar context chunks."""
+    # Trigger a search but don't call the LLM
+    matches = doc_store.search(query_text).result()
+    return matches[:limit]
 
-def add_embedding(text: str, custom_id: str = ""):
-    """Add a new embedding to the vector database."""
-    vector = embedding_model.encode(text).tolist()
-    point_id = str(uuid4())
-    payload = {"text": text}
-    if custom_id:
-        payload["id"] = custom_id
-    
-    point = PointStruct(
-        id=point_id,
-        vector=vector,
-        payload=payload
-    )
-    
-    qdrant_client.upsert(
-        collection_name=qdrant_collection,
-        points=[point]
-    )
-    return point_id
 
-def update_similar_embedding(text: str, custom_id: str = ""):
-    """Update the most similar embedding if similarity is above threshold."""
-    vector = embedding_model.encode(text).tolist()
-    results = qdrant_client.search(
-        collection_name=qdrant_collection,
-        query_vector=vector,
-        limit=1,
-        with_payload=True,
-    )
-    
-    if not results:
+def add_embedding(text: str, custom_id: str = None):
+    """Index a document chunk using Pathway pipeline."""
+    file_name = f"temp-{uuid4().hex}.txt"
+    file_path = f"./temp_docs/{file_name}"
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    # Stream the temp file into the pipeline
+    stream = pw.io.fs.read(path=file_path, format="binary", with_metadata=True)
+    doc_store.run(stream)
+
+    return custom_id or file_name
+
+
+def update_similar_embedding(text: str, custom_id: str = None):
+    """Re-index similar content by appending a new version."""
+    search_result = search_similar_embeddings(text, limit=1)
+
+    if not search_result:
         return {"status": "error", "message": "No similar entry found."}
-    
-    similarity = results[0].score
-    old_id = results[0].id
-    
+
+    similarity = search_result[0].score
     if similarity >= SIMILARITY_THRESHOLD:
-        new_id = custom_id or str(uuid4())
-        new_point = PointStruct(
-            id=old_id,  # Keep the same ID to overwrite
-            vector=vector,
-            payload={"text": text, "id": new_id}
-        )
-        qdrant_client.upsert(collection_name=qdrant_collection, points=[new_point])
+        add_embedding(text, custom_id)
         return {
-            "status": "success", 
-            "message": "Entry updated.", 
-            "old_id": old_id, 
-            "new_id": new_id, 
+            "status": "success",
+            "message": "Entry updated via re-indexing.",
             "similarity": similarity
         }
     else:
         return {
-            "status": "error", 
-            "message": "No similar entry above threshold.", 
+            "status": "error",
+            "message": "No similar entry above threshold.",
             "similarity": similarity
         }
+
 
 def delete_similar_embedding(text: str):
     """Delete the most similar embedding if similarity is above threshold."""
@@ -177,46 +180,35 @@ def delete_similar_embedding(text: str):
         }
 
 def bulk_upload_data(data_items: List[Dict[str, Any]]):
-    """Upload multiple data points to the vector database."""
-    points = []
+    """Index a list of texts into the Pathway document store."""
+    os.makedirs("./temp_docs", exist_ok=True)
+    file_paths = []
+
     for item in data_items:
-        embedding = embedding_model.encode([item["text"]])[0].tolist()
-        points.append(
-            PointStruct(
-                id=str(uuid4()),
-                vector=embedding,
-                payload={"text": item["text"], "id": item.get("id", str(uuid4()))},
-            )
-        )
-    
-    qdrant_client.upsert(collection_name=qdrant_collection, points=points)
-    return {"status": "success", "message": f"Uploaded {len(points)} items successfully."}
+        file_name = item.get("id", str(uuid4())) + ".txt"
+        path = f"./temp_docs/{file_name}"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(item["text"])
+        file_paths.append(path)
+
+    stream = pw.io.fs.read(path=file_paths, format="binary", with_metadata=True)
+    doc_store.run(stream)
+
+    return {"status": "success", "message": f"Uploaded {len(data_items)} items."}
 
 def query_with_context(query: str):
-    """Query the LLM using context from the vector database."""
-    # Fetch similar embeddings for context
-    search_result = search_similar_embeddings(query, limit=3)
-    context_chunks = [hit.payload["text"] for hit in search_result]
-    context_text = "\n".join(context_chunks)
-    
-    # Create prompt with context
-    prompt = f"Answer the question using only the context below:\n\n{context_text}\n\nQuestion: {query}\nAnswer:"
-    
-    # Call LLM
-    response = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
-    
-    answer = response.choices[0].message.content.strip()
-    
-    # Store the query and answer as embeddings
+    """Use Pathway's RAGClient to answer based on indexed context."""
+    answer = rag_client.query(query).result()
+
+    # Optionally add query and answer to index
     query_id = add_embedding(query)
     answer_id = add_embedding(answer)
-    
-    return {"answer": answer, "query_id": query_id, "answer_id": answer_id}
+
+    return {
+        "answer": answer,
+        "query_id": query_id,
+        "answer_id": answer_id
+    }
 
 # System prompt for the agent
 SYSTEM_PROMPT = """
@@ -537,5 +529,8 @@ async def delete_entry_by_similarity(data: DeleteRequest):
     return result
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("spawn")
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("mcp_server_pathway:app", host="0.0.0.0", port=8000, reload=True, log_level="debug")
+
